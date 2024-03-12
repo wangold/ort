@@ -1,12 +1,16 @@
+#![doc = include_str!("../README.md")]
+
 pub mod download;
 pub mod environment;
 pub mod error;
 pub mod execution_providers;
+pub mod io_binding;
 pub mod memory;
 pub mod metadata;
 pub mod session;
 pub mod sys;
 pub mod tensor;
+pub mod value;
 
 use std::{
 	ffi::{self, CStr},
@@ -15,33 +19,116 @@ use std::{
 	sync::{atomic::AtomicPtr, Arc, Mutex}
 };
 
-pub use environment::Environment;
-pub use error::{OrtApiError, OrtError, OrtResult};
-pub use execution_providers::ExecutionProvider;
 use lazy_static::lazy_static;
-pub use session::{Session, SessionBuilder};
+use tracing::warn;
 
-use self::sys::OnnxEnumInt;
+pub use self::environment::Environment;
+pub use self::error::{OrtApiError, OrtError, OrtResult};
+pub use self::execution_providers::ExecutionProvider;
+pub use self::io_binding::IoBinding;
+pub use self::memory::{AllocationDevice, MemoryInfo};
+pub use self::session::{InMemorySession, Session, SessionBuilder};
+pub use self::tensor::NdArrayExtensions;
+pub use self::value::Value;
 
+#[cfg(not(all(target_arch = "x86", target_os = "windows")))]
 macro_rules! extern_system_fn {
 	($(#[$meta:meta])* fn $($tt:tt)*) => ($(#[$meta])* extern "C" fn $($tt)*);
 	($(#[$meta:meta])* $vis:vis fn $($tt:tt)*) => ($(#[$meta])* $vis extern "C" fn $($tt)*);
 	($(#[$meta:meta])* unsafe fn $($tt:tt)*) => ($(#[$meta])* unsafe extern "C" fn $($tt)*);
 	($(#[$meta:meta])* $vis:vis unsafe fn $($tt:tt)*) => ($(#[$meta])* $vis unsafe extern "C" fn $($tt)*);
 }
+#[cfg(all(target_arch = "x86", target_os = "windows"))]
+macro_rules! extern_system_fn {
+	($(#[$meta:meta])* fn $($tt:tt)*) => ($(#[$meta])* extern "stdcall" fn $($tt)*);
+	($(#[$meta:meta])* $vis:vis fn $($tt:tt)*) => ($(#[$meta])* $vis extern "stdcall" fn $($tt)*);
+	($(#[$meta:meta])* unsafe fn $($tt:tt)*) => ($(#[$meta])* unsafe extern "stdcall" fn $($tt)*);
+	($(#[$meta:meta])* $vis:vis unsafe fn $($tt:tt)*) => ($(#[$meta])* $vis unsafe extern "stdcall" fn $($tt)*);
+}
 
 pub(crate) use extern_system_fn;
 
+#[cfg(feature = "load-dynamic")]
 lazy_static! {
-	pub(crate) static ref G_ORT_API: Arc<Mutex<AtomicPtr<sys::OrtApi>>> = {
-		let base: *const sys::OrtApiBase = unsafe { sys::OrtGetApiBase() };
-		assert_ne!(base, ptr::null());
-		let get_api: extern_system_fn! { unsafe fn(u32) -> *const sys::OrtApi } = unsafe { (*base).GetApi.unwrap() };
-		let api: *const sys::OrtApi = unsafe { get_api(sys::ORT_API_VERSION) };
-		Arc::new(Mutex::new(AtomicPtr::new(api as *mut sys::OrtApi)))
+	pub(crate) static ref G_ORT_DYLIB_PATH: Arc<String> = {
+		let path = match std::env::var("ORT_DYLIB_PATH") {
+			Ok(s) if !s.is_empty() => s,
+			#[cfg(target_os = "windows")]
+			_ => "onnxruntime.dll".to_owned(),
+			#[cfg(any(target_os = "linux", target_os = "android"))]
+			_ => "libonnxruntime.so".to_owned(),
+			#[cfg(target_os = "macos")]
+			_ => "libonnxruntime.dylib".to_owned()
+		};
+		Arc::new(path)
+	};
+	pub(crate) static ref G_ORT_LIB: Arc<Mutex<AtomicPtr<libloading::Library>>> = {
+		unsafe {
+			// resolve path relative to executable
+			let path: std::path::PathBuf = (&**G_ORT_DYLIB_PATH).into();
+			let absolute_path = if path.is_absolute() {
+				path
+			} else {
+				let relative = std::env::current_exe().expect("could not get current executable path").parent().unwrap().join(&path);
+				if relative.exists() {
+					relative
+				} else {
+					path
+				}
+			};
+			let lib = libloading::Library::new(&absolute_path).unwrap_or_else(|e| panic!("could not load the library at `{}`: {e:?}", absolute_path.display()));
+			Arc::new(Mutex::new(AtomicPtr::new(Box::leak(Box::new(lib)) as *mut _)))
+		}
 	};
 }
 
+lazy_static! {
+	pub(crate) static ref G_ORT_API: Arc<Mutex<AtomicPtr<sys::OrtApi>>> = {
+		#[cfg(feature = "load-dynamic")]
+		unsafe {
+			let dylib = *G_ORT_LIB
+				.lock()
+				.expect("failed to acquire ONNX Runtime dylib lock; another thread panicked?")
+				.get_mut();
+			let base_getter: libloading::Symbol<unsafe extern "C" fn() -> *const sys::OrtApiBase> = (*dylib).get(b"OrtGetApiBase").expect("");
+			let base: *const sys::OrtApiBase = base_getter();
+			assert_ne!(base, ptr::null());
+
+			let get_version_string: extern_system_fn! { unsafe fn () -> *const ffi::c_char } = (*base).GetVersionString.unwrap();
+			let version_string = get_version_string();
+			let version_string = CStr::from_ptr(version_string).to_string_lossy();
+			let lib_minor_version = version_string.split('.').nth(1).map(|x| x.parse::<u32>().unwrap_or(0)).unwrap_or(0);
+			match lib_minor_version.cmp(&16) {
+				std::cmp::Ordering::Less => panic!(
+					"ort 1.16 is not compatible with the ONNX Runtime binary found at `{}`; expected GetVersionString to return '1.16.x', but got '{version_string}'",
+					**G_ORT_DYLIB_PATH
+				),
+				std::cmp::Ordering::Greater => warn!(
+					"ort 1.16 may have compatibility issues with the ONNX Runtime binary found at `{}`; expected GetVersionString to return '1.16.x', but got '{version_string}'",
+					**G_ORT_DYLIB_PATH
+				),
+				std::cmp::Ordering::Equal => {}
+			};
+			let get_api: extern_system_fn! { unsafe fn(u32) -> *const sys::OrtApi } = (*base).GetApi.unwrap();
+			let api: *const sys::OrtApi = get_api(sys::ORT_API_VERSION);
+			Arc::new(Mutex::new(AtomicPtr::new(api as *mut sys::OrtApi)))
+		}
+		#[cfg(not(feature = "load-dynamic"))]
+		{
+			let base: *const sys::OrtApiBase = unsafe { sys::OrtGetApiBase() };
+			assert_ne!(base, ptr::null());
+			let get_api: extern_system_fn! { unsafe fn(u32) -> *const sys::OrtApi } = unsafe { (*base).GetApi.unwrap() };
+			let api: *const sys::OrtApi = unsafe { get_api(sys::ORT_API_VERSION) };
+			Arc::new(Mutex::new(AtomicPtr::new(api as *mut sys::OrtApi)))
+		}
+	};
+}
+
+/// Attempts to acquire the global [`sys::OrtApi`] object.
+///
+/// # Panics
+///
+/// Panics if another thread panicked while holding the API lock, or if the ONNX Runtime API could not be initialized.
 pub fn ort() -> sys::OrtApi {
 	let mut api_ref = G_ORT_API.lock().expect("failed to acquire OrtApi lock; another thread panicked?");
 	let api_ref_mut: &mut *mut sys::OrtApi = api_ref.get_mut();
@@ -137,12 +224,11 @@ extern_system_fn! {
 		use tracing::{span, Level, trace, debug, warn, info, error};
 
 		let log_level = match severity {
-			sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_VERBOSE => Level::TRACE,
-			sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_INFO => Level::DEBUG,
-			sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_WARNING => Level::INFO,
-			sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_ERROR => Level::WARN,
-			sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_FATAL => Level::ERROR,
-			_ => Level::TRACE
+			sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE => Level::TRACE,
+			sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO => Level::DEBUG,
+			sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING => Level::INFO,
+			sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR => Level::WARN,
+			sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_FATAL => Level::ERROR
 		};
 
 		assert_ne!(category, ptr::null());
@@ -150,7 +236,7 @@ extern_system_fn! {
 		assert_ne!(code_location, ptr::null());
 		let code_location = unsafe { CStr::from_ptr(code_location) }.to_str().unwrap_or("unknown");
 		assert_ne!(message, ptr::null());
-		let message = unsafe { CStr::from_ptr(message) };
+		let message = unsafe { CStr::from_ptr(message) }.to_str().unwrap_or("<invalid>");
 		assert_ne!(log_id, ptr::null());
 		let log_id = unsafe { CStr::from_ptr(log_id) };
 
@@ -167,35 +253,38 @@ extern_system_fn! {
 		let _enter = span.enter();
 
 		match log_level {
-			Level::TRACE => trace!("{:?}", message),
-			Level::DEBUG => debug!("{:?}", message),
-			Level::INFO => info!("{:?}", message),
-			Level::WARN => warn!("{:?}", message),
-			Level::ERROR => error!("{:?}", message)
+			Level::TRACE => trace!("{}", message),
+			Level::DEBUG => debug!("{}", message),
+			Level::INFO => info!("{}", message),
+			Level::WARN => warn!("{}", message),
+			Level::ERROR => error!("{}", message)
 		}
 	}
 }
 
-/// ONNX Runtime logging level.
+/// The minimum logging level. Logs will be handled by the `tracing` crate.
 #[derive(Debug)]
-#[cfg_attr(not(windows), repr(u32))]
-#[cfg_attr(windows, repr(i32))]
 pub enum LoggingLevel {
-	Verbose = sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_VERBOSE as OnnxEnumInt,
-	Info = sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_INFO as OnnxEnumInt,
-	Warning = sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_WARNING as OnnxEnumInt,
-	Error = sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_ERROR as OnnxEnumInt,
-	Fatal = sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_FATAL as OnnxEnumInt
+	/// Verbose logging level. This will log *a lot* of messages!
+	Verbose,
+	/// Info logging level.
+	Info,
+	/// Warning logging level. Recommended to receive potentially important warnings.
+	Warning,
+	/// Error logging level.
+	Error,
+	/// Fatal logging level.
+	Fatal
 }
 
 impl From<LoggingLevel> for sys::OrtLoggingLevel {
 	fn from(logging_level: LoggingLevel) -> Self {
 		match logging_level {
-			LoggingLevel::Verbose => sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_VERBOSE,
-			LoggingLevel::Info => sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_INFO,
-			LoggingLevel::Warning => sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_WARNING,
-			LoggingLevel::Error => sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_ERROR,
-			LoggingLevel::Fatal => sys::OrtLoggingLevel_ORT_LOGGING_LEVEL_FATAL
+			LoggingLevel::Verbose => sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
+			LoggingLevel::Info => sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_INFO,
+			LoggingLevel::Warning => sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+			LoggingLevel::Error => sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+			LoggingLevel::Fatal => sys::OrtLoggingLevel::ORT_LOGGING_LEVEL_FATAL
 		}
 	}
 }
@@ -212,7 +301,7 @@ impl From<LoggingLevel> for sys::OrtLoggingLevel {
 /// The optimizations belonging to one level are performed after the optimizations of the previous level have been
 /// applied (e.g., extended optimizations are applied after basic optimizations have been applied).
 ///
-/// **All optimizations are enabled by default.**
+/// **All optimizations (i.e. [`GraphOptimizationLevel::Level3`]) are enabled by default.**
 ///
 /// # Online/offline mode
 /// All optimizations can be performed either online or offline. In online mode, when initializing an inference session,
@@ -230,10 +319,9 @@ impl From<LoggingLevel> for sys::OrtLoggingLevel {
 ///   when the offline model is saved. For example, if model has layout optimized for AVX2, the offline model would
 ///   require CPUs that support AVX2.
 #[derive(Debug)]
-#[cfg_attr(not(windows), repr(u32))]
-#[cfg_attr(windows, repr(i32))]
 pub enum GraphOptimizationLevel {
-	Disable = sys::GraphOptimizationLevel_ORT_DISABLE_ALL as OnnxEnumInt,
+	/// Disables all graph optimizations.
+	Disable,
 	/// Level 1 includes semantics-preserving graph rewrites which remove redundant nodes and redundant computation.
 	/// They run before graph partitioning and thus apply to all the execution providers. Available basic/level 1 graph
 	/// optimizations are as follows:
@@ -254,7 +342,7 @@ pub enum GraphOptimizationLevel {
 	///   * Conv BatchNorm Fusion
 	///   * Relu Clip Fusion
 	///   * Reshape Fusion
-	Level1 = sys::GraphOptimizationLevel_ORT_ENABLE_BASIC as OnnxEnumInt,
+	Level1,
 	#[rustfmt::skip]
 	/// Level 2 optimizations include complex node fusions. They are run after graph partitioning and are only applied to
 	/// the nodes assigned to the CPU or CUDA execution provider. Available extended/level 2 graph optimizations are as follows:
@@ -275,62 +363,63 @@ pub enum GraphOptimizationLevel {
 	/// > **NOTE**: To optimize performance of the BERT model, approximation is used in GELU Approximation and Attention
 	/// Fusion for the CUDA execution provider. The impact on accuracy is negligible based on our evaluation; F1 score
 	/// for a BERT model on SQuAD v1.1 is almost the same (87.05 vs 87.03).
-	Level2 = sys::GraphOptimizationLevel_ORT_ENABLE_EXTENDED as OnnxEnumInt,
+	Level2,
 	/// Level 3 optimizations include memory layout optimizations, which may optimize the graph to use the NCHWc memory
 	/// layout rather than NCHW to improve spatial locality for some targets.
-	Level3 = sys::GraphOptimizationLevel_ORT_ENABLE_ALL as OnnxEnumInt
+	Level3
 }
 
 impl From<GraphOptimizationLevel> for sys::GraphOptimizationLevel {
 	fn from(val: GraphOptimizationLevel) -> Self {
 		match val {
-			GraphOptimizationLevel::Disable => sys::GraphOptimizationLevel_ORT_DISABLE_ALL,
-			GraphOptimizationLevel::Level1 => sys::GraphOptimizationLevel_ORT_ENABLE_BASIC,
-			GraphOptimizationLevel::Level2 => sys::GraphOptimizationLevel_ORT_ENABLE_EXTENDED,
-			GraphOptimizationLevel::Level3 => sys::GraphOptimizationLevel_ORT_ENABLE_ALL
+			GraphOptimizationLevel::Disable => sys::GraphOptimizationLevel::ORT_DISABLE_ALL,
+			GraphOptimizationLevel::Level1 => sys::GraphOptimizationLevel::ORT_ENABLE_BASIC,
+			GraphOptimizationLevel::Level2 => sys::GraphOptimizationLevel::ORT_ENABLE_EXTENDED,
+			GraphOptimizationLevel::Level3 => sys::GraphOptimizationLevel::ORT_ENABLE_ALL
 		}
 	}
 }
 
-/// Allocator type
-#[derive(Debug, Clone)]
-#[repr(i32)]
+/// Execution provider allocator type.
+#[derive(Debug, Copy, Clone)]
 pub enum AllocatorType {
-	/// Device allocator
-	Device = sys::OrtAllocatorType_OrtDeviceAllocator,
-	/// Arena allocator
-	Arena = sys::OrtAllocatorType_OrtArenaAllocator
+	/// Default device-specific allocator.
+	Device,
+	/// Arena allocator.
+	Arena
 }
 
 impl From<AllocatorType> for sys::OrtAllocatorType {
 	fn from(val: AllocatorType) -> Self {
 		match val {
-			AllocatorType::Device => sys::OrtAllocatorType_OrtDeviceAllocator,
-			AllocatorType::Arena => sys::OrtAllocatorType_OrtArenaAllocator
+			AllocatorType::Device => sys::OrtAllocatorType::OrtDeviceAllocator,
+			AllocatorType::Arena => sys::OrtAllocatorType::OrtArenaAllocator
 		}
 	}
 }
 
-/// Memory type
-#[derive(Debug, Clone)]
-#[repr(i32)]
+/// Memory types for allocated memory.
+#[derive(Debug, Copy, Clone)]
 pub enum MemType {
-	CPUInput = sys::OrtMemType_OrtMemTypeCPUInput,
-	CPUOutput = sys::OrtMemType_OrtMemTypeCPUOutput,
-	/// Default memory type
-	Default = sys::OrtMemType_OrtMemTypeDefault
+	/// Any CPU memory used by non-CPU execution provider.
+	CPUInput,
+	/// CPU accessible memory outputted by non-CPU execution provider, i.e. CUDA_PINNED.
+	CPUOutput,
+	/// The default allocator for an execution provider.
+	Default
 }
 
 impl MemType {
+	/// Temporary CPU accessible memory allocated by non-CPU execution provider, i.e. `CUDA_PINNED`.
 	pub const CPU: MemType = MemType::CPUOutput;
 }
 
 impl From<MemType> for sys::OrtMemType {
 	fn from(val: MemType) -> Self {
 		match val {
-			MemType::CPUInput => sys::OrtMemType_OrtMemTypeCPUInput,
-			MemType::CPUOutput => sys::OrtMemType_OrtMemTypeCPUOutput,
-			MemType::Default => sys::OrtMemType_OrtMemTypeDefault
+			MemType::CPUInput => sys::OrtMemType::OrtMemTypeCPUInput,
+			MemType::CPUOutput => sys::OrtMemType::OrtMemTypeCPUOutput,
+			MemType::Default => sys::OrtMemType::OrtMemTypeDefault
 		}
 	}
 }

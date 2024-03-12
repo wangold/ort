@@ -1,5 +1,8 @@
-use crate::download::{vision::Vision, ModelUrl, OnnxModel};
+//! Models for domain-based image classification.
 
+use crate::download::ModelUrl;
+
+/// Models for domain-based image classification.
 #[derive(Debug, Clone)]
 pub enum DomainBasedImageClassification {
 	/// Handwritten digit prediction using CNN.
@@ -11,11 +14,5 @@ impl ModelUrl for DomainBasedImageClassification {
 		match self {
 			DomainBasedImageClassification::Mnist => "https://github.com/onnx/models/raw/main/vision/classification/mnist/model/mnist-8.onnx"
 		}
-	}
-}
-
-impl From<DomainBasedImageClassification> for OnnxModel {
-	fn from(model: DomainBasedImageClassification) -> Self {
-		OnnxModel::Vision(Vision::DomainBasedImageClassification(model))
 	}
 }

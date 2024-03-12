@@ -1,3 +1,5 @@
+//! Types and helpers for handling ORT errors.
+
 use std::{io, path::PathBuf, string};
 
 use thiserror::Error;
@@ -7,9 +9,11 @@ use super::{char_p_to_string, ort, sys, tensor::TensorElementDataType};
 /// Type alias for the Result type returned by ORT functions.
 pub type OrtResult<T> = std::result::Result<T, OrtError>;
 
+/// An enum of all errors returned by ORT functions.
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum OrtError {
+	/// An error occurred when converting an FFI C string to a Rust `String`.
 	#[error("Failed to construct Rust String")]
 	FfiStringConversion(OrtApiError),
 	/// An error occurred while creating an ONNX environment.
@@ -21,9 +25,12 @@ pub enum OrtError {
 	/// Error occurred when creating an ONNX session.
 	#[error("Failed to create ONNX Runtime session: {0}")]
 	CreateSession(OrtApiError),
+	/// Error occurred when creating an IO binding.
+	#[error("Failed to create IO binding: {0}")]
+	CreateIoBinding(OrtApiError),
 	/// Error occurred when creating an ONNX allocator.
-	#[error("Failed to get ONNX allocator: {0}")]
-	GetAllocator(OrtApiError),
+	#[error("Failed to create ONNX allocator: {0}")]
+	CreateAllocator(OrtApiError),
 	/// Error occurred when counting ONNX session input/output count.
 	#[error("Failed to get input or output count: {0}")]
 	GetInOutCount(OrtApiError),
@@ -84,6 +91,9 @@ pub enum OrtError {
 	/// Error occurred when downloading a pre-trained ONNX model from the [ONNX Model Zoo](https://github.com/onnx/models).
 	#[error("Failed to download ONNX model: {0}")]
 	DownloadError(#[from] OrtDownloadError),
+	/// Type of input data and the ONNX model do not match.
+	#[error("Data types do not match: expected {model:?}, got {input:?}")]
+	NonMatchingDataTypes { input: TensorElementDataType, model: TensorElementDataType },
 	/// Dimensions of input data and the ONNX model do not match.
 	#[error("Dimensions do not match: {0:?}")]
 	NonMatchingDimensions(NonMatchingDimensionsError),
@@ -99,9 +109,13 @@ pub enum OrtError {
 		/// Path with invalid UTF-8
 		path: PathBuf
 	},
-	/// Attempt to build a Rust `CString` from a null pointer
+	/// Attempt to build a Rust `CString` when the original string contains a null character.
 	#[error("Failed to build CString when original contains null: {0}")]
 	FfiStringNull(#[from] std::ffi::NulError),
+	/// Attempt to build a `WideCString` when the original string contains a null character.
+	#[cfg(all(windows, feature = "profiling"))]
+	#[error("Failed to build CString when original contains null: {0}")]
+	WideFfiStringNull(#[from] widestring::error::ContainsNul<u16>),
 	#[error("{0} pointer should be null")]
 	/// ORT pointer should have been null
 	PointerShouldBeNull(String),
@@ -115,13 +129,21 @@ pub enum OrtError {
 	#[error("Failed to retrieve model metadata: {0}")]
 	GetModelMetadata(OrtApiError),
 	/// The user tried to extract the wrong type of tensor from the underlying data
-	#[error("Data type mismatch: was {:?}, tried to convert to {:?}", actual, requested)]
+	#[error("Data type mismatch: was {actual:?}, tried to convert to {requested:?}")]
 	DataTypeMismatch {
 		/// The actual type of the ort output
 		actual: TensorElementDataType,
 		/// The type corresponding to the attempted conversion into a Rust type, not equal to `actual`
 		requested: TensorElementDataType
-	}
+	},
+	#[error("Error trying to load symbol `{symbol}` from dynamic library: {error}")]
+	DlLoad { symbol: &'static str, error: String },
+	#[error("{0}")]
+	ExecutionProvider(OrtApiError),
+	#[error("Execution provider `{0}` was not registered because its corresponding Cargo feature is disabled.")]
+	ExecutionProviderNotRegistered(&'static str),
+	#[error("Expected tensor to be on CPU in order to get data, but had allocation device `{0}`.")]
+	TensorNotOnCpu(&'static str)
 }
 
 /// Error used when the input dimensions defined in the model and passed from an inference call do not match.
@@ -206,7 +228,7 @@ pub(crate) fn assert_null_pointer<T>(ptr: *const T, name: &str) -> OrtResult<()>
 pub(crate) fn assert_non_null_pointer<T>(ptr: *const T, name: &str) -> OrtResult<()> {
 	(!ptr.is_null())
 		.then_some(())
-		.ok_or_else(|| OrtError::PointerShouldBeNull(name.to_owned()))
+		.ok_or_else(|| OrtError::PointerShouldNotBeNull(name.to_owned()))
 }
 
 impl From<OrtStatusWrapper> for std::result::Result<(), OrtApiError> {

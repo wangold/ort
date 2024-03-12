@@ -1,15 +1,16 @@
 [package]
 name = "ort"
-description = "Yet another ONNX Runtime wrapper"
-version = "1.13.2"
+description = "A Rust wrapper for ONNX Runtime 1.16 - Optimize and Accelerate Machine Learning Inferencing"
+version = "1.16.3"
 edition = "2021"
+rust-version = "1.70"
 license = "MIT/Apache-2.0"
 repository = "https://github.com/pykeio/ort"
 readme = "README.md"
 keywords = [ "machine-learning", "ai", "ml" ]
 categories = [ "algorithms", "mathematics", "science" ]
 authors = [
-	"pyke.io",
+	"pyke.io <contact@pyke.io>",
 	"Nicolas Bigaouette <nbigaouette@gmail.com>"
 ]
 include = [ "src/", "examples/", "tests/", "toolchains/", "build.rs", "LICENSE", "README.md" ]
@@ -21,21 +22,18 @@ strip = true
 codegen-units = 1
 
 [package.metadata.docs.rs]
-features = [ "half", "fetch-models", "copy-dylibs", "disable-build-script" ]
+features = [ "half", "fetch-models", "copy-dylibs" ]
 
 [features]
-default = [ "half", "fetch-models", "copy-dylibs" ]
-# used to prevent issues with docs.rs
-disable-build-script = []
+default = [ "half", "download-binaries", "copy-dylibs" ]
+
+profiling = [ "widestring" ]
 
 fetch-models = [ "ureq" ]
-generate-bindings = [ "bindgen" ]
+download-binaries = [ "ureq", "zip" ]
+load-dynamic = [ "libloading" ]
 copy-dylibs = []
 
-# ONNX compile flags
-prefer-compile-strategy = []
-prefer-system-strategy = []
-prefer-dynamic-libs = []
 minimal-build = []
 experimental = []
 mimalloc = []
@@ -46,7 +44,6 @@ tensorrt = []
 openvino = []
 onednn = []
 directml = []
-snpe = []
 nnapi = []
 coreml = []
 xnnpack = []
@@ -58,15 +55,14 @@ migraphx = []
 rknpu = []
 vitis = []
 cann = []
+qnn = []
 
 [dependencies]
 ndarray = "0.15"
-num-complex = "0.4"
-num-traits = "0.2"
 thiserror = "1.0"
+libloading = { version = "0.7", optional = true }
 
-# onnx
-ureq = { version = "2.1", optional = true }
+ureq = { version = "2.1", optional = true, default-features = false, features = [ "tls" ] }
 lazy_static = "1.4"
 tracing = "0.1"
 half = { version = "2.1", optional = true }
@@ -76,20 +72,20 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [ "std", "libloaderapi" ] }
+widestring = { version = "1.0", optional = true }
 
 [dev-dependencies]
+anyhow = "1.0"
 ureq = "2.1"
 image = "0.24"
 test-log = { version = "0.2", default-features = false, features = [ "trace" ] }
 tracing-subscriber = { version = "0.3", default-features = false, features = [ "env-filter", "fmt" ] }
-rust_tokenizers = "7.0"
+tokenizers = { version = ">=0.13.4", default-features = false, features = [ "onig" ] }
 rand = "0.8"
 
 [build-dependencies]
-casey = "0.3"
-bindgen = { version = "0.63", optional = true }
-ureq = "2.1"
-zip = { version = "0.6", default-features = false, features = [ "deflate" ] }
+ureq = { version = "2.1", optional = true, default-features = false, features = [ "tls" ] }
+zip = { version = "0.6", optional = true, default-features = false, features = [ "deflate" ] }
 
 [target.'cfg(not(target_os = "windows"))'.build-dependencies]
 flate2 = "1.0"
